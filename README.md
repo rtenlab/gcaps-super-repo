@@ -1,9 +1,9 @@
 # GCAPS: GPU Context-Aware Preemptive Scheduling Approach
 
 ## Publications
-This repository includes the source code of our paper ["GCAPS: GPU Context-Aware Preemptive Priority-based Scheduling for Real-Time Tasks."]()
+This repository includes the source code of our paper ["GCAPS: GPU Context-Aware Preemptive Priority-based Scheduling for Real-Time Tasks."](files/ecrts24_gcaps_paper.pdf)
 
-![alt text](figures/image.png)
+![alt text](files/image.png)
 
 The description of this scheduling approach can be found in the following paper in ECRTS 2024:
 * Yidi Wang, Cong Liu, Daniel Wong, and Hyoseung Kim. GCAPS: GPU Context-Aware Preemptive Priority-based Scheduling for Real-Time Tasks. In Euromicro Conference on Real-Time Systems (ECRTS), 2024.

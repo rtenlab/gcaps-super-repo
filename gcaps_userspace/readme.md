@@ -1,6 +1,6 @@
 # GCAPS Userspace Implementation
 This folder includes the userspace implementation for GCAPS method [1].
-The two macros to mark the GPU segment boundaries are defined [here]().
+The two macros to mark the GPU segment boundaries are defined [here](common/include/support.h#L99-L131).
 :exclamation::exclamation: **Before proceeding, please finish deploying the driver code first.**
 
 ## Preparations

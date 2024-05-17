@@ -87,6 +87,6 @@ This folder includes the implementation of GCAPS approach in Tegra driver.
     sync
     sudo reboot
     ```
-    :red_circle: Note: for `nvgpu-ctrl.h`, remember to change the corresponding path in userspace [Makefile]().
+    :red_circle: Note: for `nvgpu-ctrl.h`, remember to change the corresponding path in userspace [Makefile](../gcaps_userspace/Makefile#L34).
 
 :smiley: **After all the above steps are done, now you can move forward and test GCAPS preemptive GPU approach with [GCAPS userspace implementation](../gcaps_userspace/readme.md).**
