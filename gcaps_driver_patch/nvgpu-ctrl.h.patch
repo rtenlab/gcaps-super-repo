@@ -1,0 +1,35 @@
+--- nvgpu-ctrl.h	2024-05-16 15:31:47
++++ nvgpu-ctrl_new.h	2024-05-16 16:26:39
+@@ -1098,6 +1098,18 @@
+ 	 * of this field.
+ 	 */
+ 	__u32 flags;
++};
++
++/* the sturct used to pass the arguments by each user program */
++struct nvgpu_gpu_runlist_update_rt_prio_args {
++	bool sync_mode; /* true if gpu sync-based mode is used */
++	/* [in] caller's pid */
++	pid_t pid;
++	/* 
++	 * [in] the caller wants to be added/removed to the runlist 
++	 * !add should be called when the at the end of the caller's function
++	 */
++	bool add_req;
+ };
+ 
+ #define NVGPU_GPU_IOCTL_ZCULL_GET_CTX_SIZE \
+\ No newline at end of file
+@@ -1187,8 +1199,10 @@
+ 	_IOWR(NVGPU_GPU_IOCTL_MAGIC,  41, struct nvgpu_gpu_register_buffer_args)
+ #define NVGPU_GPU_IOCTL_GET_BUFFER_INFO	\
+ 	_IOWR(NVGPU_GPU_IOCTL_MAGIC,  42, struct nvgpu_gpu_get_buffer_info_args)
++#define NVGPU_GPU_IOCTL_RUNLIST_UPDATE_RT_PRIO \
++	_IOWR(NVGPU_GPU_IOCTL_MAGIC, 43, struct nvgpu_gpu_runlist_update_rt_prio_args)
+ #define NVGPU_GPU_IOCTL_LAST		\
+-	_IOC_NR(NVGPU_GPU_IOCTL_GET_BUFFER_INFO)
++	_IOC_NR(NVGPU_GPU_IOCTL_RUNLIST_UPDATE_RT_PRIO)
+ #define NVGPU_GPU_IOCTL_MAX_ARG_SIZE	\
+ 	sizeof(struct nvgpu_gpu_get_cpu_time_correlation_info_args)
+ 
+\ No newline at end of file

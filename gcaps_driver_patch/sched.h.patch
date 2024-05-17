@@ -1,0 +1,45 @@
+--- sched.h	2024-05-16 15:33:24
++++ sched_new.h	2024-05-16 16:25:04
+@@ -26,6 +26,29 @@
+ #include <nvgpu/lock.h>
+ #include <nvgpu/cond.h>
+ 
++#define RL_CTRL_NO_RT_PID 0
++#define RL_CTRL_NO_RT_PRIO 0
++
++/* valid only if #pid is a rt task */
++/* It records the rt task in the runlist */
++struct nvgpu_rt_rl {
++	pid_t pid;
++	int rt_prio;
++};
++
++/***** Preemptive GPU Scheduling Related Params *****/
++struct nvgpu_rl_ctrl {
++	/* the bitmap of TSGs which are scheduled in runlists */
++	unsigned long *tsg_running;
++	/* the pid of the rt task whose TSGs are currently in the runlist. = -1 if no rt task */
++	struct nvgpu_rt_rl rt_task_in_rl;
++	/* the bitmap of TSGs which is waiting to be added to runlists */
++	unsigned long *tsg_pending;
++	unsigned long *curr_tsgs_in_rl;
++};
++
++#include <linux/rtmutex.h>
++
+ struct nvgpu_sched_ctrl {
+ 	struct nvgpu_mutex control_lock;
+ 	bool control_locked;
+\ No newline at end of file
+@@ -41,6 +64,10 @@
+ 	u64 *ref_tsg_bitmap;
+ 
+ 	struct nvgpu_cond readout_wq;
++
++	struct nvgpu_rl_ctrl rl_ctrl;
++	struct nvgpu_mutex sync_fence_lock;
++	struct rt_mutex cs_lock;
+ };
+ 
+ #endif /* NVGPU_SCHED_COMMON_H */
+\ No newline at end of file

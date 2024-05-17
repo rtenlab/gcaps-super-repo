@@ -1,0 +1,296 @@
+--- ioctl_ctrl.c	2024-05-16 15:30:32
++++ ioctl_ctrl_new.c	2024-05-16 16:25:35
+@@ -48,6 +48,7 @@
+ #include <nvgpu/gr/gr_instances.h>
+ #include <nvgpu/gr/warpstate.h>
+ #include <nvgpu/channel.h>
++#include <nvgpu/runlist.h>
+ #include <nvgpu/pmu/pmgr.h>
+ #include <nvgpu/pmu/therm.h>
+ #include <nvgpu/power_features/pg.h>
+\ No newline at end of file
+@@ -2222,7 +2223,270 @@
+ 
+ 	return err;
+ }
++
++/**
++ * Description: get the task and its tsgs with the highest priority from pending tsgs
++ * 
++ * @param #pid_h: [out]
++ * @param #tsg_bitmap: [out] the bitmap of tsgs of proc #pid_h
++ */
++void nvgpu_get_tsgs_with_highest_prio_locked(struct gk20a *g, 
++											pid_t *pid_next,
++											int *rt_prio_next,
++											unsigned long *tsgs_next) {
++	struct nvgpu_fifo *f = &g->fifo;
++	struct nvgpu_sched_ctrl *sched = &g->sched_ctrl;
++	struct nvgpu_tsg *tsg;
++	struct task_struct *task;
++	int prio_highest = 0;
++	int i = 0;
++
++	*pid_next = -1;
++	*tsgs_next = 0;
++	*rt_prio_next = 0;
++
++	for (i = 0; i < f->num_channels; i++) {
++		tsg = &f->tsg[i];
++		if (!NVGPU_SCHED_ISSET(tsg->tsgid, sched->active_tsg_bitmap)) {
++			continue;
++		}
++		/* tsg in pending list */
++		if (nvgpu_test_bit(i, sched->rl_ctrl.tsg_pending)) {
++			task = pid_task(find_vpid(tsg->tgid), PIDTYPE_PID);
++			if (task && (task->rt_priority <= 99 && task->rt_priority >= 1) && task->rt_priority > prio_highest) {
++				prio_highest = task->rt_priority;
++				*pid_next = tsg->tgid;
++			}
++		}	
++	}
++
++	if (*pid_next == -1) {
++		return;
++	}
++
++	task = pid_task(find_vpid(*pid_next), PIDTYPE_PID);
++	*rt_prio_next = task->rt_priority;
++
++	for (i = 0; i < f->num_channels; i++) {
++		tsg = &f->tsg[i];
++		if (tsg->tgid == *pid_next) {
++			nvgpu_set_bit(i, tsgs_next);
++		}
++	}
++}
++
++/** 
++ * Description: TSGs management in the runlist
++ * 
++ * *****************************************
++ * #op_type stands for regular GPU segments.
++ * 
++ * Steps:
++ * - If the caller task requests to be added to the runlists with #op_type:
++ * 		- If the caller task is not a rt task, then check #pid_rt_kernel and #pid_rt_memcpy
++ * 			- if there is no rt task in runlists of the same #op_type as caller requested, add caller task to the runlist
++ * 			- otherwise, remove the caller
++ * 		- If the caller task is a rt task, then check #pid_rt_kernel and #pid_rt_memcpy
++ * 			- if the prio of the caller task is higher than the current prio, add the caller task to the runlist and remove the other tasks with same #op_type
++ * 			- if the prio of the caller task is not higher than the current prio (with the same #op_type), remove the caller task from runlists
++ * - If the caller task requests to be removed from the runlists with #op_type:
++ * 		- find the highest rt task in #tsg_pending_kernel or #tsg_pending_memcpy (of the same #op_type)
++ * 			- if not exist, resume all tasks in #tsg_pending_kernel or #tsg_pending_memcpy
++ * 			- if exist, add this task to runlists
++ */
++int nvgpu_ioctl_runlist_update_rt_prio(struct gk20a *g, 
++		struct nvgpu_gpu_runlist_update_rt_prio_args *args) 
++{
++	struct nvgpu_fifo *f = &g->fifo;
++	struct nvgpu_sched_ctrl *sched = &g->sched_ctrl;
++	struct nvgpu_rl_ctrl *rl_ctrl = &sched->rl_ctrl;
++	struct nvgpu_rt_rl *rt_task_in_rl = &rl_ctrl->rt_task_in_rl;
++	struct task_struct *task_caller;
++	struct task_struct *task_next;
++	int i, j;
++	int err = 0;
++	pid_t cpid = args->pid;
++	bool add_req = args->add_req;
++	bool sync_mode = args->sync_mode;
++	/* the complete bitmap of TSGs to be in the runlists. "set" to be added, "clear" to be removed */
++	unsigned long *new_tsg_in_rl = nvgpu_kzalloc(g, sched->bitmap_size);
++	/* the bitmap of the tsgs of the caller task */
++	unsigned long *tsgs_cpid = nvgpu_kzalloc(g, sched->bitmap_size);
++	bool exist = false;
++	ktime_t start_time;
++	ktime_t stop_time;
++	s64 elapsed_time;
+ 
++	pid_t pid_next = -1;
++	int rt_prio_next = 0;
++	/* when the caller requests to be removed, the next tsgs with highest rt prio */
++	unsigned long *tsgs_next = nvgpu_kzalloc(g, sched->bitmap_size);
++		
++	char except_proc_names[][32] = {"Xorg", "gnome-shell"};
++
++	*new_tsg_in_rl = 0;
++	*tsgs_cpid = 0;
++	*tsgs_next = 0;
++
++	task_caller = pid_task(find_vpid(cpid), PIDTYPE_PID);
++
++	/* sync-based approach, no need to update runlists */
++	if (sync_mode == true) {
++		if (add_req == true) {
++			nvgpu_mutex_acquire(&sched->sync_fence_lock);
++			return 0;
++		}else {
++			nvgpu_mutex_release(&sched->sync_fence_lock);
++			return 0;
++		}
++	}
++
++	rt_mutex_lock(&sched->cs_lock);
++	start_time = ktime_get();
++	/* get tsgs of the excepted proc */
++	for (i = 0; i < f->num_channels; i++) {
++		struct nvgpu_tsg *tsg = &f->tsg[i];
++		struct task_struct *task = pid_task(find_vpid(tsg->tgid), PIDTYPE_PID);
++		if (task == NULL) {
++			continue;
++		}
++		for (j = 0; j < 2; j++) {
++			if (strcmp(except_proc_names[j], task->comm) == 0) {
++				nvgpu_set_bit(i, new_tsg_in_rl);
++				break;
++			}
++		}
++	}
++
++	/* get tsgs of the caller task by pid */
++	for (i = 0; i < f->num_channels; i++) {
++		struct nvgpu_tsg *tsg = &f->tsg[i];
++		if (!NVGPU_SCHED_ISSET(tsg->tsgid, sched->active_tsg_bitmap)) {
++			continue;
++		}
++		if (tsg->tgid == cpid) {
++			nvgpu_set_bit(i, tsgs_cpid);
++		}
++	}
++
++	if (add_req) { /* the caller task requests to be added */
++		if (task_caller->rt_priority <= 0) { /* the caller task is not a rt task */
++			/* no rt task of the same #op_type, add the caller to runlists */
++			if (rt_task_in_rl->pid == RL_CTRL_NO_RT_PID) {
++				// pr_info("------ be task pid %d add request granted\n", cpid);
++				/* no rt task being scheduled in the runlists, add the caller to runlists */
++				*rl_ctrl->tsg_running |= *tsgs_cpid;
++				*rl_ctrl->tsg_pending &= ~(*tsgs_cpid);
++			}else { /* there is a rt task in runlists*/
++				/* nothing else should be removed from runlists, add caller to pending */
++				// pr_info("------ be task pid %d add request pending\n", cpid);
++				*rl_ctrl->tsg_pending |= *tsgs_cpid;
++				*rl_ctrl->tsg_running &= ~(*tsgs_cpid);
++			}
++			/* not need to update #rt_rl_kernel and #rt_rl_memcpy */
++		}else { /* the caller task is a rt task */
++			/* do not allow interleaved execution if tasks are of the same rt_prio, use FIFO in this case */
++			/* the caller's rt_prio is higher than the running one of the same #op_type, add it to the runlists, and REMOVE the current running ones (add to pending) */
++			if (task_caller->rt_priority > rt_task_in_rl->rt_prio) {
++				/* the caller's rt_prio is higher than the running one of the same #op_type, add it to the runlists, and REMOVE the current running ones (add to pending) */
++				// pr_info("------ rt task pid %d add request granted\n", cpid);
++					*rl_ctrl->tsg_pending |= *rl_ctrl->tsg_running;
++					*rl_ctrl->tsg_running = *tsgs_cpid;
++					*rl_ctrl->tsg_pending &= ~(*tsgs_cpid);
++					rt_task_in_rl->pid = cpid;
++					rt_task_in_rl->rt_prio = task_caller->rt_priority;
++			}else {
++				/* the caller's rt_prio is not higher than the running one of the same #op_type, remove it from runlists */
++				// pr_info("------ rt task pid %d add request pending\n", cpid);
++				*rl_ctrl->tsg_pending |= *tsgs_cpid;
++				*rl_ctrl->tsg_running &= ~(*tsgs_cpid);
++			}
++		}
++	}else { /* the caller task requests to be removed */	
++		// todo: check pid_next logic
++		nvgpu_get_tsgs_with_highest_prio_locked(g, &pid_next, &rt_prio_next, tsgs_next);
++		if (pid_next > 0) {
++			// pr_info("rt task pid %d requested to be removed, pid_next %d\n", cpid, pid_next);
++			if (pid_next == cpid) { // case 1: the caller task is a rt task
++				// pr_alert("this must be reported: pid_next = tsgs_cpid");
++				*rl_ctrl->tsg_pending &= ~(*tsgs_next);
++				*rl_ctrl->tsg_running &= ~(*tsgs_next);
++				if (*rl_ctrl->tsg_running == 0) { // only be task left
++					rt_task_in_rl->pid = RL_CTRL_NO_RT_PID;
++					rt_task_in_rl->rt_prio = RL_CTRL_NO_RT_PRIO;
++				}
++			}else {
++				task_next = pid_task(find_vpid(pid_next), PIDTYPE_PID);
++				/* found the next rt task of #op_type, add ONLY this task to runlists */
++				*rl_ctrl->tsg_running = *tsgs_next;
++				*rl_ctrl->tsg_pending &= ~(*tsgs_next);
++				rt_task_in_rl->pid = pid_next;
++				rt_task_in_rl->rt_prio = rt_prio_next;
++			}
++		}else { // no pending rt task 
++			// pr_info("task pid %d requested to be removed. No real-time task pending. Resuming all tasks. ", cpid);
++			*rl_ctrl->tsg_pending &= ~(*tsgs_cpid);
++			*rl_ctrl->tsg_running &= ~(*tsgs_cpid);
++			// search tsg_running for rt tasks
++			for (i = 0; i < f->num_channels; i++) {
++				struct nvgpu_tsg *tsg = &f->tsg[i];
++				struct task_struct *task = pid_task(find_vpid(tsg->tgid), PIDTYPE_PID);
++				if (!NVGPU_SCHED_ISSET(tsg->tsgid, sched->active_tsg_bitmap)) {
++					continue;
++				}
++				if (nvgpu_test_bit(i, sched->rl_ctrl.tsg_running)) {
++					task = pid_task(find_vpid(tsg->tgid), PIDTYPE_PID);
++					if (task && (task->rt_priority <= 99 && task->rt_priority >= 1)) {
++						// pr_alert("this must be reported: a pending be task is requesting to be removed, running rt task: %d.", tsg->tgid);
++						rt_task_in_rl->pid = tsg->tgid;
++						rt_task_in_rl->rt_prio = task->rt_priority;
++						exist = true;
++						break;
++					}
++				}	
++			}
++			if (exist == false) { // only be task left
++				/* no rt task of #op_type exists, resume all TSGs */
++				*rl_ctrl->tsg_running = *rl_ctrl->tsg_pending;
++				*rl_ctrl->tsg_pending = 0;
++				rt_task_in_rl->pid = RL_CTRL_NO_RT_PID;
++				rt_task_in_rl->rt_prio = RL_CTRL_NO_RT_PRIO;
++			}
++		}
++	}
++
++	if ((*rl_ctrl->tsg_running & *rl_ctrl->tsg_pending) != 0) {
++		pr_warn("running and pending tsgs are not exclusive!!!");
++	}
++	*new_tsg_in_rl |= (*rl_ctrl->tsg_running); // using OR because of the excpetion tasks
++
++	/* update runlist */
++	if (*new_tsg_in_rl != *rl_ctrl->curr_tsgs_in_rl) {
++		for (i = 0; i < f->num_channels; i++) {
++			struct nvgpu_tsg *tsg = &f->tsg[i];
++			struct nvgpu_channel *ch;
++			bool add = nvgpu_test_bit(i, new_tsg_in_rl);
++
++			nvgpu_list_for_each_entry(ch, &tsg->ch_list,
++					nvgpu_channel, ch_entry) {
++				err = g->ops.runlist.update(g, tsg->runlist, ch, add, true); // runlist lock is inside of it
++				if (err < 0) {
++					nvgpu_err(g, "update_by_pid failed");
++					goto done;
++				}
++			}
++		}
++		*rl_ctrl->curr_tsgs_in_rl = *new_tsg_in_rl;
++	}
++
++done:
++	stop_time = ktime_get();
++	elapsed_time = ktime_to_ns(ktime_sub(stop_time, start_time)) / 1000; // us
++	pr_info("process %d elapsed time: %lld", cpid, elapsed_time);
++	rt_mutex_unlock(&sched->cs_lock); 
++	return err;
++}
++
+ long gk20a_ctrl_dev_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+ {
+ 	struct gk20a_ctrl_priv *priv = filp->private_data;
+\ No newline at end of file
+@@ -2596,6 +2860,11 @@
+ 		err = nvgpu_gpu_ioctl_get_buffer_info(g,
+ 			(struct nvgpu_gpu_get_buffer_info_args *)buf);
+ 		break;
++	
++	case NVGPU_GPU_IOCTL_RUNLIST_UPDATE_RT_PRIO: // 43
++		err = nvgpu_ioctl_runlist_update_rt_prio(g, 
++			(struct nvgpu_gpu_runlist_update_rt_prio_args *)buf);
++		break;
+ 
+ 	default:
+ 		nvgpu_log_info(g, "unrecognized gpu ioctl cmd: 0x%x", cmd);
+\ No newline at end of file

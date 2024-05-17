@@ -1,0 +1,71 @@
+--- sched.c	2024-05-16 15:32:40
++++ sched_new.c	2024-05-16 16:27:48
+@@ -587,6 +587,34 @@
+ 	 * when TSGs are added, so that it can apply sched params
+ 	 */
+ 	nvgpu_mutex_release(&sched->status_lock);
++}
++
++int gk20a_sched_rl_ctrl_init(struct gk20a *g) {
++	struct nvgpu_sched_ctrl *sched = &g->sched_ctrl;
++	struct nvgpu_rl_ctrl *rl_ctrl = &sched->rl_ctrl;
++
++	rl_ctrl->tsg_running = nvgpu_kzalloc(g, sched->bitmap_size);
++	if (!rl_ctrl->tsg_running) {
++		return -ENOMEM;
++	}
++
++	rl_ctrl->tsg_pending = nvgpu_kzalloc(g, sched->bitmap_size);
++	if (!rl_ctrl->tsg_pending) {
++		return -ENOMEM;
++	}
++	rl_ctrl->curr_tsgs_in_rl = nvgpu_kzalloc(g, sched->bitmap_size);
++	if (!rl_ctrl->curr_tsgs_in_rl) {
++		return -ENOMEM;
++	}
++
++	*rl_ctrl->tsg_running = 0;
++	*rl_ctrl->tsg_pending = 0;
++	*rl_ctrl->curr_tsgs_in_rl = 0;
++
++	rl_ctrl->rt_task_in_rl.pid = RL_CTRL_NO_RT_PID;
++	rl_ctrl->rt_task_in_rl.rt_prio = RL_CTRL_NO_RT_PRIO;
++
++	return 0;
+ }
+ 
+ int gk20a_sched_ctrl_init(struct gk20a *g)
+\ No newline at end of file
+@@ -620,12 +648,21 @@
+ 		goto free_recent;
+ 	}
+ 
++	err = gk20a_sched_rl_ctrl_init(g);
++	if (err != 0) {
++		pr_warn("gk20a_sched_rl_ctrl_init failed!");
++		return err;
++	}
++
+ 	nvgpu_cond_init(&sched->readout_wq);
+ 
+ 	nvgpu_mutex_init(&sched->status_lock);
+ 	nvgpu_mutex_init(&sched->control_lock);
+ 	nvgpu_mutex_init(&sched->busy_lock);
+ 
++	nvgpu_mutex_init(&sched->sync_fence_lock);
++	rt_mutex_init(&sched->cs_lock);
++
+ 	sched->sw_ready = true;
+ 
+ 	return 0;
+\ No newline at end of file
+@@ -653,5 +690,8 @@
+ 	nvgpu_mutex_destroy(&sched->control_lock);
+ 	nvgpu_mutex_destroy(&sched->busy_lock);
+ 
++	nvgpu_mutex_destroy(&sched->sync_fence_lock);
++	rt_mutex_destroy(&sched->cs_lock);
++
+ 	sched->sw_ready = false;
+ }
+\ No newline at end of file
