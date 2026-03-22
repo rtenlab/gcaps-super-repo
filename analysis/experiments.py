@@ -12,6 +12,8 @@ from dataclasses import dataclass
 from enum import IntEnum
 import numpy as np
 import argparse
+import threading
+import copy
 
 from sched_common import *
 
@@ -54,7 +56,24 @@ class policy_type(IntEnum):
 
     tsg_rr_suspend = 12
     tsg_rr_busy = 13
+
+    kthread_busy = 14
+    kthread_busy_gpu_prio = 15
     
+
+def run_policies_parallel(tasks, policies, results, idx):
+    def worker(tasks_copy, pid):
+        ret = select_policy(tasks_copy, policies[pid])
+        if ret:
+            results[idx][pid] += 1
+
+    threads = [threading.Thread(target=worker, args=(copy.deepcopy(tasks), pid))
+               for pid in range(len(policies))]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
 
 def select_policy(tasks: List[Task], policy_id: int) -> int:
     ret = False
@@ -82,7 +101,14 @@ def select_policy(tasks: List[Task], policy_id: int) -> int:
         ret = rt_test_dft(tasks, False)
     elif policy_id == policy_type.tsg_rr_busy:
         ret = rt_test_dft(tasks, True)
-
+    elif policy_id == policy_type.kthread_busy:
+        ret = rt_test_gcaps(tasks, True, 1)
+    elif policy_id == policy_type.kthread_busy_gpu_prio:
+        ret = rt_test_gcaps(tasks, True, 1)
+        if ret == False:
+            ret = rt_test_gcaps_gprio(tasks, True, 1)
+            if ret == False: # debugging
+                print_taskset(tasks)
     tasks = clear_task_response_time(tasks)
     return ret
 
@@ -95,17 +121,19 @@ def select_policy(tasks: List[Task], policy_id: int) -> int:
 def expr1(group_id: int, expr_id: int, loop_num: int):
     print("Running general experiments against prior works...")
     if expr_id == 1:
-        print("expr_id: {} (number of best-effort tasks in the taskset)".format(expr_id))
+        print("expr_id: {} (Number of tasks in the system)".format(expr_id))
     elif expr_id == 2:
-        print("expr_id: {} (Number of tasks per cpu)".format(expr_id))
-    elif expr_id == 3:
-        print("expr_id: {} (ratio of gpu execution to cpu execution)".format(expr_id))
-    elif expr_id == 4:
         print("expr_id: {} (utilization per cpu)".format(expr_id))
-    elif expr_id == 5:
+    elif expr_id == 3:
         print("expr_id: {} (number of cpus)".format(expr_id))
-    elif expr_id == 6:
+    elif expr_id == 4:
         print(f"expr_id: {expr_id} (ratio of gpu using tasks)")
+    elif expr_id == 5:
+        print("expr_id: {} (ratio of gpu execution to cpu execution)".format(expr_id))
+    elif expr_id == 6:
+        print("expr_id: {} (number of best-effort tasks in the taskset)".format(expr_id))
+    elif expr_id == 7:
+        print("expr_id: {} (number of GPU segments in the GPU tasks)".format(expr_id))
     else:
         print("expr_id: {} unknown, exiting".format(expr_id))
         exit()
@@ -119,8 +147,9 @@ def expr1(group_id: int, expr_id: int, loop_num: int):
             # policy_type.ioctl_busy_gpu_prio,
             # policy_type.ioctl_suspend_gpu_prio,
             # policy_type.tsg_rr_busy,
-            # policy_type.tsg_rr_suspend
-            0, 1, 2, 3, 9, 10, 12, 13
+            # policy_type.tsg_rr_suspend,
+            # policy_type.kthread_busy
+            9, 10, 12, 13, 15
         ]
     elif group_id == 3:  # experiment 3: gain of GPU segment priority assignment
         policies = [
@@ -139,79 +168,73 @@ def expr1(group_id: int, expr_id: int, loop_num: int):
     results = [[0 for j_ in range(len(policies))] for i_ in range(20)]
     num_configs = 0
 
-    if expr_id == 1: # percentage of be tasks
+    if expr_id == 1: # number of tasks in the taskset
+        # config_num_tasks = list(np.arange(3, 6 + 1, 1)) 
+        config_num_tasks = list(np.arange(12, 12 + 1, 2))
+        for idx in range(len(config_num_tasks)):
+            for niter in range(loop_num):
+                tasks = taskset_generation(params, expr_gid, config_num_tasks[idx], 0)
+                # print_taskset(tasks)
+                run_policies_parallel(tasks, policies, results, idx)
+            print(f"# Setting {idx} completed...", end="")
+        num_configs = len(config_num_tasks)
+    elif expr_id == 2: 
+        config_util_per_cpu = list(np.arange(0.1, 1 + 0.1, 0.1))
+        for idx in range(len(config_util_per_cpu)):
+            params.range_util_per_cpu[0] = params.range_util_per_cpu[1] = config_util_per_cpu[idx]
+            for niter in range(loop_num):
+                tasks = taskset_generation(params, expr_gid, -1, 0)
+                # print_taskset(tasks)
+                run_policies_parallel(tasks, policies, results, idx)
+            print(f"# Setting {idx} completed...", end="")
+            num_configs = len(config_util_per_cpu)
+    elif expr_id == 3: # number of cpus
+        config_ncpu = list(np.arange(1, 9 + 1, 1))
+        for idx in range(len(config_ncpu)):
+            params.ncpu = config_ncpu[idx]
+            for niter in range(loop_num):
+                tasks = taskset_generation(params, expr_gid, -1, 0)
+                run_policies_parallel(tasks, policies, results, idx)
+            print(f"# Setting {idx} completed...", end="")
+        num_configs = len(config_ncpu)
+    elif expr_id == 4: # ratio of gpu using tasks
+        config_ratio_of_gpu_tasks = list(np.arange(0.1, 1 + 0.1, 0.1))
+        for idx in range(len(config_ratio_of_gpu_tasks)):
+            params.range_ratio_of_gpu_tasks[0] = params.range_ratio_of_gpu_tasks[1] = config_ratio_of_gpu_tasks[idx]
+            for niter in range(loop_num):
+                tasks = taskset_generation(params, expr_gid, -1, 0)
+                run_policies_parallel(tasks, policies, results, idx)
+            print(f"# Setting {idx} completed...", end="")
+        num_configs = len(config_ratio_of_gpu_tasks)
+    elif expr_id == 5: 
+        config_ratio_g_to_c = list(np.arange(0, 1 + 0.1, 0.1))
+        for idx in range(len(config_ratio_g_to_c)):
+            params.range_ratio_g_to_c[0] = params.range_ratio_g_to_c[1] = config_ratio_g_to_c[idx]
+            for niter in range(loop_num):
+                tasks = taskset_generation(params, expr_gid, -1, 0)
+                run_policies_parallel(tasks, policies, results, idx)
+            print(f"# Setting {idx} completed...", end="")
+        num_configs = len(config_ratio_g_to_c)
+    if expr_id == 6: # percentage of be tasks
         # we have to use maximum number of tasks per core here
         params.range_num_tasks_per_cpu[0] = params.range_num_tasks_per_cpu[1]
         config_percentage_be_tasks = list(np.arange(0, 0.9, 0.1)) 
         for idx in range(len(config_percentage_be_tasks)):
             for niter in range(loop_num):                
                 tasks = taskset_generation(params, expr_gid, -1, config_percentage_be_tasks[idx])
-                for pid in range(len(policies)):
-                    ret = select_policy(tasks, policies[pid])
-                    if ret == True:
-                        results[idx][pid] += 1
+                run_policies_parallel(tasks, policies, results, idx)
             print(f"# Setting {idx} completed...", end="")
         num_configs = len(config_percentage_be_tasks)
-    elif expr_id == 2: # number of tasks in the taskset
-        config_num_tasks = list(np.arange(2, 20 + 1, 2)) 
-        for idx in range(len(config_num_tasks)):
-            for niter in range(loop_num):
-                tasks = taskset_generation(params, expr_gid, config_num_tasks[idx], 0)
-                for pid in range(len(policies)):
-                    ret = select_policy(tasks, policies[pid])
-                    if ret == True:
-                        results[idx][pid] += 1
-            print(f"# Setting {idx} completed...", end="")
-        num_configs = len(config_num_tasks)
-    elif expr_id == 3: 
-        config_ratio_g_to_c = list(np.arange(0, 1 + 0.1, 0.1))
-        for idx in range(len(config_ratio_g_to_c)):
-            params.range_ratio_g_to_c[0] = params.range_ratio_g_to_c[1] = config_ratio_g_to_c[idx]
-            for niter in range(loop_num):
+    if expr_id == 7: # number of GPU segments
+        config_number_of_ges = list(np.arange(1, 10+1, 1))
+        for idx in range(len(config_number_of_ges)):
+            params.range_num_ges_per_task[0] = params.range_num_ges_per_task[1] = config_number_of_ges[idx]
+            for niter in range(loop_num):                
                 tasks = taskset_generation(params, expr_gid, -1, 0)
-                for pid in range(len(policies)):
-                    ret = select_policy(tasks, policies[pid])
-                    if ret == True:
-                        results[idx][pid] += 1
+                run_policies_parallel(tasks, policies, results, idx)
             print(f"# Setting {idx} completed...", end="")
-        num_configs = len(config_ratio_g_to_c)
-    elif expr_id == 4: 
-        config_util_per_cpu = list(np.arange(0.1, 1 + 0.1, 0.1))
-        for idx in range(len(config_util_per_cpu)):
-            params.range_util_per_cpu[0] = params.range_util_per_cpu[1] = config_util_per_cpu[idx]
-            for niter in range(loop_num):
-                tasks = taskset_generation(params, expr_gid, -1, 0)
-                for pid in range(len(policies)):
-                    ret = select_policy(tasks, policies[pid])
-                    if ret == True:
-                        results[idx][pid] += 1
-            print(f"# Setting {idx} completed...", end="")
-            num_configs = len(config_util_per_cpu)
-    elif expr_id == 5: # number of cpus
-        config_ncpu = list(np.arange(1, 9 + 1, 1))
-        for idx in range(len(config_ncpu)):
-            params.ncpu = config_ncpu[idx]
-            for niter in range(loop_num):
-                tasks = taskset_generation(params, expr_gid, -1, 0)
-                for pid in range(len(policies)):
-                    ret = select_policy(tasks, policies[pid])
-                    if ret == True:
-                        results[idx][pid] += 1
-            print(f"# Setting {idx} completed...", end="")
-        num_configs = len(config_ncpu)
-    elif expr_id == 6: # ratio of gpu using tasks
-        config_ratio_of_gpu_tasks = list(np.arange(0.1, 1 + 0.1, 0.1))
-        for idx in range(len(config_ratio_of_gpu_tasks)):
-            params.range_ratio_of_gpu_tasks[0] = params.range_ratio_of_gpu_tasks[1] = config_ratio_of_gpu_tasks[idx]
-            for niter in range(loop_num):
-                tasks = taskset_generation(params, expr_gid, -1, 0)
-                for pid in range(len(policies)):
-                    ret = select_policy(tasks, policies[pid])
-                    if ret == True:
-                        results[idx][pid] += 1
-            print(f"# Setting {idx} completed...", end="")
-        num_configs = len(config_ratio_of_gpu_tasks)
-
+        num_configs = len(config_number_of_ges)
+    
     # print each policy first as col
     print()
     for n_ in range(num_configs):

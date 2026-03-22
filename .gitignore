@@ -56,3 +56,6 @@ dkms.conf
 
 patches
 files_src
+
+analysis/plots
+analysis/__pycache__/

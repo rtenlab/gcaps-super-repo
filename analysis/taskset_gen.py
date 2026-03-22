@@ -77,6 +77,83 @@ def random_divider(total: float, n: int) -> List[float]:
     random.shuffle(segments)
     return segments 
 
+def uunifast_divider(total: float, n: int, min_floor: float = 0.01) -> List[float]:
+    """
+    Randomly divides 'total' into 'n' parts using the UUnifast algorithm logic.
+    Ensures no part is smaller than 'min_floor' and the sum equals 'total' exactly.
+    """
+    if n * min_floor > total:
+        total = n * min_floor
+        # raise ValueError(f"Total {total} is too small to split into {n} parts with min_floor {min_floor}")
+
+    if n == 1:
+        return [total]
+
+    # 1. Reserve the floor to guarantee no zeros
+    # We will distribute the 'effective_total' randomly, then add min_floor back later.
+    effective_total = total - (n * min_floor)
+    
+    current_sum = effective_total
+    segments = []
+    
+    # 2. UUnifast Loop
+    # We generate n-1 split points
+    for i in range(1, n):
+        # Exponent logic: 1 / (decreasing counter)
+        exponent = 1.0 / (n - i)
+        rand_val = random.random() ** exponent
+        
+        # KEY FIX: The random value determines the NEXT sum (the part we keep),
+        # not the segment size. This keeps the distribution uniform.
+        next_sum = current_sum * rand_val
+        seg = current_sum - next_sum
+        
+        segments.append(seg)
+        current_sum = next_sum
+    
+    # The last remaining bit is the final segment
+    segments.append(current_sum)
+    
+    # 3. Add floor back and round
+    # We add min_floor to ensure we stay above 0, then round to 2 decimals.
+    final_segments = [round(s + min_floor, 2) for s in segments]
+    
+    # 4. Fix Rounding Drift
+    # Rounding to 2 decimals usually results in a sum slightly off from 'total'.
+    # We calculate the difference and apply it to the first segment.
+    current_final_sum = sum(final_segments)
+    diff = round(total - current_final_sum, 2)
+    
+    if diff != 0:
+        # Add the dust (positive or negative) to the first element
+        # (Since we shuffle later, it doesn't matter which one gets it)
+        final_segments[0] = round(final_segments[0] + diff, 2)
+
+    random.shuffle(final_segments)
+    return final_segments
+
+def partition_into_four(n):
+    base = int(n // 4)
+    remainder = n % 4
+    # Create a list where the first 'remainder' elements get an extra 1
+    return [base + 1] * remainder + [base] * (4 - remainder)
+
+def random_partition_into_four(n: int, min_val: int = 0):
+    """
+    Randomly partitions integer 'n' into 4 parts using Stars and Bars logic.
+    Each part will have at least 'min_val'.
+    """
+    if n < 4 * min_val:
+        raise ValueError(f"Cannot partition {n} into 4 parts with min_val {min_val}")
+
+    excess = n - (4 * min_val)
+    cuts = sorted([random.randint(0, excess) for _ in range(3)])
+    bounds = [0] + cuts + [excess]
+    return [
+        (bounds[i+1] - bounds[i]) + min_val 
+        for i in range(4)
+    ]
+
 
 def sort_tasks_RM(tasks: List[Task]):
     rt_tasks = sorted([task for task in tasks if task.prio >= 0], key=lambda task: task.T)
@@ -101,10 +178,11 @@ class Params():
     def __init__(self):
         self.ncpu = 4
         self.range_num_tasks_per_cpu = [3, 6]
+        # self.range_num_tasks_per_cpu = [1, 3]
         self.range_ratio_of_gpu_tasks = [0.4, 0.6] 
         self.range_task_period = [[30, 500], [30, 500]]
         self.range_util_per_cpu = [0.4, 0.6] 
-        self.range_task_util = [0.05, 0.3]
+        self.range_task_util = [0.01, 0.3]
         self.range_num_ges_per_task = [1, 3]
         self.range_ratio_g_to_c = [0.2, 2]
         self.range_ratio_gm_to_g = [0.1, 0.3]
@@ -143,14 +221,16 @@ def create_single_task(params: Params,
             task.T = get_rand([100, 200], 10)
             task.U = get_rand([0.05, 0.3])
     
-    E = task.U * task.T
+    E = round(task.U * task.T, 2)
+    # print(f"Creating task with T = {task.T}, U = {task.U}, E = {E}")
 
     n_ges = 0
     if is_gpu_task == True:
         task.C_hi = round(E / (1 + get_rand(params.range_ratio_g_to_c)), 2)
         task.G_hi = round(E - task.C_hi, 2)    
         n_ges = get_rand(params.range_num_ges_per_task, 0)
-        ges = random_divider(task.G_hi, n_ges)
+        # ges = random_divider(task.G_hi, n_ges)
+        ges = uunifast_divider(task.G_hi, n_ges, 0.01)
         for i in range(n_ges):
             task.ges.append(GPUseg())
             task.ges[i].G_hi = ges[i]
@@ -165,7 +245,8 @@ def create_single_task(params: Params,
         n_ces = n_ges + 1
     else:
         n_ces = 1
-    ces = random_divider(task.C_hi, n_ces)
+    # ces = random_divider(task.C_hi, n_ces)
+    ces = uunifast_divider(task.C_hi, n_ces, 0.01)
     for i in range(n_ces):
         task.ces.append(CPUseg())
         task.ces[i].C_hi = ces[i]
@@ -228,17 +309,41 @@ def random_taskset_uunifast(params: Params, expr_gid: int, num_tasks: int, perce
                 num_tasks_on_cpu = get_rand(params.range_num_tasks_per_cpu)
                 util_cpu = get_rand(params.range_util_per_cpu)
                 util_list = random_divider(util_cpu, num_tasks_on_cpu)
+                # util_list = uunifast_divider(util_cpu, num_tasks_on_cpu, 0.01)
                 for j in range(num_tasks_on_cpu):
                     is_gpu_task = random.random() < get_rand(params.range_ratio_of_gpu_tasks, 0)
                     params.range_task_util[0] = params.range_task_util[1] = max(util_list[j], 0.01) # forcing the generated util is non-zero
                     task = create_single_task(params, expr_gid, is_gpu_task, -1, cpuid)
                     tasks.append(task)
+        # yidi: 01/28/2026 below is the original version, kept for reference
+        # in this version, total number of tasks is generated first, then assigned to cpus with WFD
+        # elif num_tasks > 0:
+        #     # generate util for each task, then follow wfd
+        #     for i in range(num_tasks):
+        #         is_gpu_task = random.random() < get_rand(params.range_ratio_of_gpu_tasks, 0)
+        #         task = create_single_task(params, expr_gid, is_gpu_task, -1, -1)
+        #         tasks.append(task)
+        # yidi: new version
         elif num_tasks > 0:
-            # generate util for each task, then follow wfd
-            for i in range(num_tasks):
-                is_gpu_task = random.random() < get_rand(params.range_ratio_of_gpu_tasks, 0)
-                task = create_single_task(params, expr_gid, is_gpu_task, -1, -1)
-                tasks.append(task)
+            nums = partition_into_four(num_tasks)
+            for cpuid in range(params.ncpu):
+                num_tasks_on_cpu = nums[cpuid]
+                # num_tasks_on_cpu = num_tasks
+                # params.range_util_per_cpu[0] = params.range_util_per_cpu[1] = 0.3
+                util_cpu = get_rand(params.range_util_per_cpu)
+                # util_cpu = num_tasks_on_cpu * 0.1
+                # util_list = random_divider(util_cpu, num_tasks_on_cpu)
+                util_list = uunifast_divider(util_cpu, num_tasks_on_cpu, 0.01)
+                util_list = [min(u, 0.20) for u in util_list]  
+                target_util_per_task = 0.1  
+                for j in range(num_tasks_on_cpu):
+                    is_gpu_task = random.random() < get_rand(params.range_ratio_of_gpu_tasks, 0)
+                    params.range_task_util[0] = params.range_task_util[1] = max(util_list[j], 0.01) # forcing the generated util is non-zero
+                    # params.range_task_util[0] = params.range_task_util[1] = target_util_per_task
+                    task = create_single_task(params, expr_gid, is_gpu_task, -1, cpuid)
+                    tasks.append(task)
+                # print(f"util_list = {util_list}")
+                # print(f"num_tasks = {num_tasks_on_cpu}, util_cpu = {util_cpu}")
 
     num_tasks = len(tasks)
     # * assign priority globally
@@ -284,7 +389,7 @@ def taskset_generation(params: Params, expr_gid: int, num_tasks: int = -1, perce
         cid = tasks[i].cpu
         if cid != -1:
             cpus[cid].util += tasks[i].U
-    sort_tasks_util(tasks) # sort with decreasing util first
+    tasks = sort_tasks_util(tasks) # sort with decreasing util first
     for i in range(len(tasks)):
         if tasks[i].cpu != -1: # already assigned
             continue

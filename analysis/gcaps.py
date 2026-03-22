@@ -21,7 +21,7 @@ decimal.getcontext().prec = 2
 # @return: True if the taskset is schedulable, False if not
 #################################################################################
 def rt_test(tasks: List[Task], no_suspension: bool = False, approach: int = 0) -> bool:
-    if approach != 0:
+    if approach != 0 and approach != 1:
         print("Invalid approach id! Exiting...")
         exit()
 
@@ -36,6 +36,11 @@ def rt_test(tasks: List[Task], no_suspension: bool = False, approach: int = 0) -
             WR_curr = tasks[i].C_hi + tasks[i].G_hi
             if approach == 0: # ioctl approach
                 WR_curr += epsilon + 3 * epsilon * len(tasks[i].ges)
+            # if approach == 1 and tasks[i].cpu == 0 and len(tasks[i].ges) > 0: # kthread approach; having blocking time; same as kthread cpu
+            #     for h in tasks[i].hp_set:
+            #         if len(tasks[h].ges) > 0:
+            #             J = (tasks[h].WR - tasks[h].C_hi - tasks[h].G_hi)
+            #             WR_curr += 2 * epsilon * math.ceil((WR_prev + J) / tasks[h].T) + 2 * epsilon
             # compute the preemption time by cpu execution
             for h in tasks[i].hpp_set:
                 ''' basic analysis equations below '''
@@ -53,6 +58,8 @@ def rt_test(tasks: List[Task], no_suspension: bool = False, approach: int = 0) -
                         WR_curr += math.ceil((WR_prev) / tasks[h].T) * (tasks[h].C_hi)
                     else:
                         WR_curr += math.ceil((WR_prev) / tasks[h].T) * (tasks[h].C_hi + tasks[h].G_hi + 2 * epsilon * len(tasks[h].ges))
+                elif approach == 1 and no_suspension == True:
+                    WR_curr += math.ceil((WR_prev) / tasks[h].T) * (tasks[h].C_hi + tasks[h].G_hi)
 
             # compute the preemption time by gpu execution
             for h in tasks[i].hp_set:
@@ -71,6 +78,21 @@ def rt_test(tasks: List[Task], no_suspension: bool = False, approach: int = 0) -
                         continue # next h
                     J = tasks[h].WR - tasks[h].Ge_hi
                     WR_curr += math.ceil((WR_prev + J) / tasks[h].T) * (tasks[h].Ge_hi + 2 * epsilon * len(tasks[h].ges))
+                elif approach == 1 and no_suspension == True: # kthread
+                    if h in tasks[i].hpp_set:   
+                        continue # next h
+                    if len(tasks[h].ges) > 0:
+                        J = tasks[h].WR - tasks[h].G_hi - tasks[h].C_hi
+                        WR_curr += math.ceil((WR_prev + J) / tasks[h].T) * (tasks[h].G_hi + tasks[h].C_hi)
+
+                # Compute blocking for kthread approach
+                if approach == 1 and no_suspension == True and (tasks[i].cpu == 0 or len(tasks[i].ges) > 0): # assume kthread is always pinned on cpu 0
+                    for h in tasks[i].hp_set:
+                        if len(tasks[h].ges) == 0:
+                            continue
+                        J = tasks[h].T - tasks[h].C_hi - tasks[h].G_hi
+                        WR_curr += math.ceil((WR_prev + J) / tasks[h].T) * 2 * epsilon
+                    WR_curr += 2 * epsilon
 
             if WR_prev == WR_curr and WR_curr <= tasks[i].T:
                 tasks[i].WR = WR_curr
@@ -114,6 +136,11 @@ def can_take_lowest_prio(tasks: List[Task], tasks_: List[Task], ordering: List[T
         WR_curr = tasks_[idx].C_hi + tasks_[idx].G_hi
         if approach == 0: # ioctl approach
             WR_curr += epsilon + 3 * epsilon * len(tasks_[idx].ges)
+        # if approach == 1 and tasks_[idx].cpu == 0 and len(tasks_[idx].ges) > 0: # kthread approach; having blocking time; same as kthread cpu
+        #         for h in tasks_[idx].hp_set:
+        #             if len(tasks[h].ges) > 0:
+        #                 J = (tasks[h].WR - tasks[h].C_hi - tasks[h].G_hi)
+        #                 WR_curr += 2 * epsilon * math.ceil((WR_prev + J) / tasks[h].T) + 2 * epsilon
         # since `tasks_` is sorted with RM order, higher-priority tasks have index `h < idx`. CPU preemption occurs on the same core
         for h in tasks_[idx].hpp_set: # h != idx # no kthread approach. This h is the index in list tasks
             ''' basic analysis equations'''
@@ -124,13 +151,16 @@ def can_take_lowest_prio(tasks: List[Task], tasks_: List[Task], ordering: List[T
                     J = (tasks[h].T - tasks[h].C_hi - tasks[h].Gm_hi)
                     WR_curr += math.ceil((WR_prev + J) / tasks[h].T) * (tasks[h].C_hi + tasks[h].Gm_hi + 2 * epsilon * len(tasks[h].ges))
                 if len(tasks[h].ges) > 0 and len(tasks_[idx].ges) > 0:
-                    J = tasks[h].WR - tasks[h].Ge_hi
+                    # J = tasks[h].WR - tasks[h].Ge_hi
+                    J = tasks[h].T - tasks[h].Ge_hi
                     WR_curr += math.ceil((WR_prev + J) / tasks[h].T) * (tasks[h].Ge_hi)
             elif approach == 0 and no_suspension == True: # ioctl-busy
                 if len(tasks[h].ges) == 0: # eta^g_h == 0, cpu-only task
                     WR_curr += math.ceil((WR_prev) / tasks[h].T) * (tasks[h].C_hi)
                 else:
                     WR_curr += math.ceil((WR_prev) / tasks[h].T) * (tasks[h].C_hi + tasks[h].G_hi + 2 * epsilon * len(tasks[h].ges))
+            elif approach == 1 and no_suspension == True: # kthread-busy
+                WR_curr += math.ceil((WR_prev) / tasks[h].T) * (tasks[h].C_hi + tasks[h].G_hi)
                 
         # since `tasks_[idx]` is not necessarily to be the last one in the list, and lower-priority tasks are already popped, any task in `tasks_` can have a higher gpu priority than `tasks_[idx]`
         for h in gh_set:
@@ -149,6 +179,20 @@ def can_take_lowest_prio(tasks: List[Task], tasks_: List[Task], ordering: List[T
                     continue
                 J = tasks[h].T - tasks[h].Ge_hi
                 WR_curr += math.ceil((WR_prev + J) / tasks[h].T) * (tasks[h].Ge_hi+ 2 * epsilon * len(tasks[h].ges))
+            elif approach == 1 and no_suspension == True: # kthread-busy
+                if h in tasks_[idx].hpp_set:
+                    continue
+                J = tasks[h].T - tasks[h].C_hi - tasks[h].G_hi
+                WR_curr += math.ceil((WR_prev + J) / tasks[h].T) * (tasks[h].C_hi + tasks[h].G_hi)
+        
+        # Compute Ki for kthread approach
+        if approach == 1 and no_suspension == True and (tasks_[idx].cpu == 0 or len(tasks_[idx].ges) > 0): # assume kthread is always pinned on cpu 0
+            for h in gh_set: # higher-prio tasks on cpu
+                if len(tasks[h].ges) == 0:
+                    continue
+                J = tasks[h].T - tasks[h].C_hi - tasks[h].G_hi
+                WR_curr += math.ceil((WR_prev + J) / tasks[h].T) * 2 * epsilon
+            WR_curr += 2 * epsilon
 
         if WR_prev == WR_curr and WR_curr <= tasks_[idx].T:
             # tasks_[idx].WR = WR_curr
@@ -187,7 +231,7 @@ def can_take_lowest_prio(tasks: List[Task], tasks_: List[Task], ordering: List[T
 # @return: True if the taskset is schedulable under new GPU priority assignation; False if not
 ##########################################################################
 def rt_test_gpu_seg_prio(tasks: List[Task], no_suspension: bool = False, approach: bool = 0) -> int:
-    if approach != 0:
+    if approach != 0 and approach != 1:
         print("Invalid approach id! Exiting...")
         exit()
     # tasks in `tasks` are ordered by RM priority by default
